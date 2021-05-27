@@ -1,0 +1,417 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use threads;
+use threads::shared;
+
+use Data::Dumper;
+use Math::BigFloat;
+use Time::Duration;
+use DBI;
+use Chart::Gnuplot;
+
+my $SCRIPT_PATH;
+my $LIB_PATH;
+my $INPUT_PATH;
+my $OUTPUT_PATH;
+
+BEGIN {
+    use File::Basename qw(dirname);
+    $SCRIPT_PATH = dirname(__FILE__) . '/../libscript';
+    $LIB_PATH    = dirname(__FILE__) . '/../lib';
+    $INPUT_PATH  = dirname(__FILE__) . '/../i';
+    $OUTPUT_PATH = dirname(__FILE__) . '/../o';
+}
+use lib $SCRIPT_PATH;
+use lib $LIB_PATH;
+
+use Object;
+
+my $DEBUG = 0;
+
+#Multiple of seconds in which to step
+#my $STEP_MULTIPLE = 1;    #By second
+#my $STEP_MULTIPLE = 60;    #By minute
+#my $STEP_MULTIPLE = 60*60;    #By hour
+my $STEP_MULTIPLE = 60 * 60 * 24;    #By day
+
+my $UNIVERSE;
+my $TIME;
+my $G  = Math::BigFloat->new('6.674E-11');
+my $AU = Math::BigFloat->new('149597871000');
+my $PI = Math::BigFloat->bpi(100);
+
+sub init {
+    $TIME = 0;
+    my $dbh = DBI->connect(
+        "dbi:CSV:",
+        undef, undef,
+        {   f_ext      => ".csv/r",
+            f_dir      => $INPUT_PATH,
+            RaiseError => 1,
+        }
+    ) or die "Cannot connect: $DBI::errstr";
+    my $sql = "SELECT Object, Color, Mass, X, Y, Z, VX, VY, VZ FROM PLANETS";
+    my $sth = $dbh->prepare($sql);
+    $sth->execute;
+    my ( $name, $color, $mass, $x, $y, $z, $vx, $vy, $vz );
+    $sth->bind_columns( \$name, \$color, \$mass, \$x, \$y, \$z, \$vx, \$vy, \$vz );
+
+    while ( $sth->fetch ) {
+        push @{$UNIVERSE},
+            Object->new(
+            {   name => "$name",
+                color => "$color",
+                mass => "$mass",
+                px   => "$x",
+                py   => "$y",
+                pz   => "$z",
+                vx   => "$vx",
+                vy   => "$vy",
+                vz   => "$vz",
+            }
+            );
+    }
+
+}
+
+sub sim {
+    my $dbh = DBI->connect(
+        "dbi:CSV:",
+        undef, undef,
+        {   f_ext      => ".csv/r",
+            f_dir      => $OUTPUT_PATH,
+            RaiseError => 1,
+        }
+    ) or die "Cannot connect: $DBI::errstr";
+
+    #Destory previous run
+    if ( ( scalar $dbh->tables( undef, 'main', 'ORBITS', 'TABLE' ) ) ) {
+        $dbh->do("DROP TABLE ORBITS");
+    }
+
+    #Create Table
+    my $s = "CREATE TABLE ORBITS(Time INT";
+    foreach my $object_index ( 0 .. $#{$UNIVERSE} ) {
+        my $object = $UNIVERSE->[$object_index];
+        $s .= sprintf ", %s_x TEXT, %s_y TEXT, %s_z TEXT",
+            $object->name,
+            $object->name,
+            $object->name;
+    }
+    $s .= ")";
+    $dbh->do($s);
+
+    my $max_steps = $DEBUG ? 2 : 100 * 365;
+
+    $s = "INSERT INTO ORBITS values (?";
+    foreach my $object_index ( 0 .. $#{$UNIVERSE} ) {
+        $s .= ",?,?,?";
+    }
+    $s .= ")";
+
+    for my $steps ( 0 .. $max_steps - 1 ) {
+        printf "Step %d of %d (%6.2f%%)\n", $steps, $max_steps,
+            $steps / $max_steps * 100
+            if $steps % 10 == 0;
+        step();
+
+        my @insert;
+        push @insert, $steps * $STEP_MULTIPLE;
+        foreach my $object_index ( 0 .. $#{$UNIVERSE} ) {
+            my $object = $UNIVERSE->[$object_index];
+            push @insert, sprintf "%E", $object->position->{x};
+            push @insert, sprintf "%E", $object->position->{y};
+            push @insert, sprintf "%E", $object->position->{z};
+        }
+
+        $dbh->do( $s, undef, @insert );
+
+    }
+
+}
+
+sub step {
+
+    print "Time: $TIME\n" if $DEBUG;
+
+    my $forces;
+
+    #Process
+    my $force_threads;
+    foreach my $object_index ( 0 .. $#{$UNIVERSE} ) {
+        $force_threads->[$object_index] = threads->create(
+            { 'context' => 'list' },
+            sub {
+                my $object = $UNIVERSE->[$object_index];
+
+                my %force;
+                $force{x} = Math::BigFloat->new(0);
+                $force{y} = Math::BigFloat->new(0);
+                $force{z} = Math::BigFloat->new(0);
+
+                printf "  %s\n", $object->name if $DEBUG;
+
+                print '  ' . $#{$UNIVERSE} . " other objects\n" if $DEBUG;
+                foreach my $other_object_index ( 0 .. $#{$UNIVERSE} ) {
+                    next if ( $other_object_index == $object_index );
+                    my $other_object = $UNIVERSE->[$other_object_index];
+
+                    printf "    %8s ", $other_object->name if $DEBUG;
+
+                    my $r = {
+                        x => $other_object->position->{x}
+                            ->copy->bsub( $object->position->{x} ),
+                        y => $other_object->position->{y}
+                            ->copy->bsub( $object->position->{y} ),
+                        z => $other_object->position->{z}
+                            ->copy->bsub( $object->position->{z} )
+                    };
+
+                    my $r_mag = $r->{x}->copy->bpow(2);
+                    $r_mag->badd( $r->{y}->copy->bpow(2) );
+                    $r_mag->badd( $r->{z}->copy->bpow(2) );
+                    $r_mag->bsqrt();
+                    my $r_unit = {
+                        x => ( $r->{x}->copy->bdiv($r_mag) )[0],
+                        y => ( $r->{y}->copy->bdiv($r_mag) )[0],
+                        z => ( $r->{z}->copy->bdiv($r_mag) )[0]
+                    };
+
+                    #Generate force
+                    printf "G:%E m1:%E m2:%E r:%E\n",
+                        $G, $object->mass, $other_object->mass, $r_mag
+                        if $DEBUG;
+                    my $f_mag = $G->copy;
+                    $f_mag->bmul( $object->mass );
+                    $f_mag->bmul( $other_object->mass );
+                    $f_mag->bdiv( $r_mag->copy->bpow(2) );
+                    my $f = {
+                        x => $f_mag->copy->bmul( $r_unit->{x} ),
+                        y => $f_mag->copy->bmul( $r_unit->{y} ),
+                        z => $f_mag->copy->bmul( $r_unit->{z} )
+                    };
+                    printf "force:% 12E:<% 12E,% 12E,% 12E>kgm/s^2\n",
+                        $f_mag, $f->{x}, $f->{y}, $f->{z}
+                        if $DEBUG;
+
+                    #Add force vector to total
+                    $force{x}->badd( $f->{x} );
+                    $force{y}->badd( $f->{y} );
+                    $force{z}->badd( $f->{z} );
+
+                }
+
+                printf "    Total force:<%E,%E,%E>kgm/s^2\n",
+                    $force{x}, $force{y}, $force{z}
+                    if $DEBUG;
+                return %force;
+            }
+        );
+    }
+
+    my $force_results;
+    foreach my $object_index ( 0 .. $#{$UNIVERSE} ) {
+        %{ $force_results->[$object_index] }
+            = $force_threads->[$object_index]->join;
+    }
+
+    #Update
+    foreach my $object_index ( 0 .. $#{$UNIVERSE} ) {
+        my $object = $UNIVERSE->[$object_index];
+        printf
+            "    %8s init  v:<% 12E,% 12E,% 12E>m/s  p:<% 12E,% 12E,% 12E>m\n",
+            $object->name,
+            $object->velocity->{x},
+            $object->velocity->{y},
+            $object->velocity->{z},
+            $object->position->{x},
+            $object->position->{y}, $object->position->{z}
+            if $DEBUG;
+        $object->update( $STEP_MULTIPLE, $force_results->[$object_index] );
+        printf
+            "    %8s final v:<% 12E,% 12E,% 12E>m/s  p:<% 12E,% 12E,% 12E>m\n",
+            $object->name,
+            $object->velocity->{x},
+            $object->velocity->{y},
+            $object->velocity->{z},
+            $object->position->{x},
+            $object->position->{y}, $object->position->{z}
+            if $DEBUG;
+
+    }
+    $TIME += $STEP_MULTIPLE;
+    return;
+}
+
+sub chart {
+    my $dbh = DBI->connect(
+        "dbi:CSV:",
+        undef, undef,
+        {   f_ext      => ".csv/r",
+            f_dir      => $OUTPUT_PATH,
+            RaiseError => 1,
+        }
+    ) or die "Cannot connect: $DBI::errstr";
+    #my $gif = Chart::Gnuplot->new(
+    #    output    => '../o/plot.gif',
+    #    imagesize => "1440.0, 1080.0",
+    #);
+    #my @charts;
+
+    my @AU_grid;
+    my @circle_ref;
+    for ( my $degree = 0; $degree <= 360; $degree += 10 ) {
+        print "$degree\n";
+        my $cos    = ( $PI->copy->bmul($degree)->bdiv(180) )[0]->bcos();
+        my $sin    = ( $PI->copy->bmul($degree)->bdiv(180) )[0]->bsin();
+        push @{ $circle_ref[0] }, $sin->copy;
+        push @{ $circle_ref[1] }, $cos->copy;
+    }
+
+    foreach my $distance ( 0 .. 33 ) {
+        print "$distance\n";
+        foreach my $index (0 .. $#{ $circle_ref[0] }) {
+        push @{ $AU_grid[$distance][0] }, sprintf '%E',
+            $circle_ref[0][$index]->copy->bmul($distance)->bmul($AU);
+        push @{ $AU_grid[$distance][1] }, sprintf '%E',
+            $circle_ref[1][$index]->copy->bmul($distance)->bmul($AU);
+        push @{ $AU_grid[$distance][2] }, "-10E12";
+        }
+    }
+
+    my @AU_dataset;
+    foreach my $AU_gridline (@AU_grid) {
+        push @AU_dataset,
+            Chart::Gnuplot::DataSet->new(
+            xdata    => $AU_gridline->[0],
+            ydata    => $AU_gridline->[1],
+            zdata    => $AU_gridline->[2],
+            style    => 'lines',
+            linetype => 'dash',
+            color    => 'grey',
+            );
+    }
+
+    my @positions;
+    foreach my $object ( @{$UNIVERSE} ) {
+        push @positions,
+            {
+            name => $object->name,
+            color => $object->color,
+            x    => undef,
+            y    => undef,
+            z    => undef,
+            };
+    }
+
+    my $sql = sprintf "SELECT * FROM ORBITS";
+    my $sth = $dbh->prepare($sql);
+    $sth->execute;
+    my $count=0;
+    mkdir '../tmp';
+    while ( my $row = $sth->fetchrow_hashref ) {
+        my $time  = $row->{time};
+        print "Generating: ".duration($time)."\n";
+        my @ds;
+        my $chart = Chart::Gnuplot->new(
+            output    => '../tmp/plot.'.sprintf('%010d',$count).'.png',
+            imagesize => "2.142857142857, 2.142857142857",
+            title => {
+                        text => duration($time),
+                        color => 'white',
+                     },
+            #xlabel => 'x',
+            #ylabel => 'y',
+            #zlabel => 'z',
+            border => undef,
+            xtics  => undef,
+            ytics  => undef,
+            ztics  => undef,
+            xrange => [ "-5E12", "5E12" ],
+            yrange => [ "-5E12", "5E12" ],
+            zrange => [ "*", "1E12" ],
+            bg => 'black',
+            view => '30,0',
+        );
+        #$chart->add3d(@AU_dataset);
+        push @ds, @AU_dataset;
+
+        foreach my $object (@positions) {
+
+            push my @point,
+                [
+                $row->{ lc $object->{name} . "_x" },
+                $row->{ lc $object->{name} . "_y" },
+                $row->{ lc $object->{name} . "_z" },
+                ];
+
+            my @x_line_to_path = [
+                $row->{ lc $object->{name} . "_x" },
+                $row->{ lc $object->{name} . "_x" }
+            ];
+            my @y_line_to_path = [
+                $row->{ lc $object->{name} . "_y" },
+                $row->{ lc $object->{name} . "_y" }
+            ];
+            my @z_line_to_path
+                = [ $row->{ lc $object->{name} . "_z" }, "-10E12" ];
+
+            push @{ $object->{x} }, $row->{ lc $object->{name} . "_x" };
+            push @{ $object->{y} }, $row->{ lc $object->{name} . "_y" };
+            push @{ $object->{z} }, "-10E12";
+
+            my @x_path = @{ $object->{x} };
+            my @y_path = @{ $object->{y} };
+            my @z_path = @{ $object->{z} };
+
+            my $points = Chart::Gnuplot::DataSet->new(
+                points => \@point,
+                style  => 'points',
+                color => $object->{color},
+            );
+            my $lines_to_paths = Chart::Gnuplot::DataSet->new(
+                xdata => \@x_line_to_path,
+                ydata => \@y_line_to_path,
+                zdata => \@z_line_to_path,
+                style => 'lines',
+                color => $object->{color},
+            );
+            my $paths = Chart::Gnuplot::DataSet->new(
+                xdata => \@x_path,
+                ydata => \@y_path,
+                zdata => \@z_path,
+                style => 'lines',
+                color => $object->{color},
+            );
+
+            #$chart->add3d($paths);
+            #$chart->add3d($lines_to_paths);
+            #$chart->add3d($points);
+            push @ds, $paths;          
+            push @ds, $lines_to_paths; 
+            push @ds, $points;         
+        }
+        $chart->plot3d(@ds);
+        #push @charts, $chart;
+        $count++;
+    }
+    #$gif->animate(
+    #    charts => \@charts,
+    #    delay  => .1,
+    #);
+    system('avconv -framerate 60 -i ../tmp/plot.%010d.png -s:v 1920x1080 -c:v libx264 -profile:v high -crf 18 -pix_fmt yuv420p -r 60 ../o/plot.mp4');
+}
+
+sub main {
+    my $universe;
+    my $time = 0;
+
+    init;
+    sim;
+    chart;
+}
+
+main;
